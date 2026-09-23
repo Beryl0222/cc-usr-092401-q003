@@ -96,7 +96,8 @@ class ApiTest(unittest.TestCase):
             })
             self.assertEqual(status, 200, target)
         status, result = self.call("export_batch", {
-            "scope": "海外", "actor": "王编辑", "role": "编辑",
+            "scope": "海外", "page_ids": [page["id"]],
+            "actor": "王编辑", "role": "编辑",
         })
         self.assertEqual(status, 200)
         self.assertEqual([p["page_id"] for p in result["pages"]], [page["id"]])
@@ -114,7 +115,8 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(any("过期" in item for item in blockers))
         _, result = self.call("export_batch", {
-            "scope": "海外", "actor": "王编辑", "role": "编辑",
+            "scope": "海外", "page_ids": [page["id"]],
+            "actor": "王编辑", "role": "编辑",
         })
         self.assertEqual(result["pages"], [])
         self.assertIn(page["id"], result["excluded"])
@@ -131,6 +133,134 @@ class ApiTest(unittest.TestCase):
         })
         self.assertEqual(status, 409)
         self.assertEqual(body["kind"], "StaleVersionError")
+
+    def test_version_binding_end_to_end(self):
+        source, segment, design, page = self._seed_page()
+        _, old = self.call("sign_opinion", {
+            "target_kind": "page", "target_id": page["id"], "scope": "史实",
+            "stance": "日期为9月25日", "content": "第一版意见",
+            "author": "李专家", "role": "党史专家",
+        })
+        # 页面改到第二版。
+        status, v2 = self.call("new_page_version", {
+            "page_id": page["id"],
+            "script_refs": {segment["id"]: 1},
+            "design_refs": {design["id"]: 1},
+            "source_refs": {source["id"]: 1},
+            "actor": "学员甲", "base_version": 1,
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(v2["version"], 2)
+
+        # 旧意见不能再被采纳改变新稿状态。
+        status, body = self.call("adopt_opinion", {
+            "opinion_id": old["id"], "actor": "王编辑", "role": "编辑",
+        })
+        self.assertEqual(status, 400)
+        self.assertEqual(body["kind"], "StateError")
+        self.assertIn("已过期", body["error"])
+
+        # 只能转签到新版本, 再由编辑采纳。
+        status, fresh = self.call("countersign_opinion", {
+            "opinion_id": old["id"], "actor": "李专家", "role": "党史专家",
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(fresh["target_version"], 2)
+        self.assertEqual(fresh["countersigned_from"], old["id"])
+        status, _ = self.call("adopt_opinion", {
+            "opinion_id": fresh["id"], "actor": "王编辑", "role": "编辑",
+        })
+        self.assertEqual(status, 200)
+
+    def test_cross_version_opinions_do_not_create_conflict(self):
+        source, segment, design, page = self._seed_page()
+        _, first = self.call("sign_opinion", {
+            "target_kind": "page", "target_id": page["id"], "scope": "史实",
+            "stance": "日期为9月25日", "content": "v1",
+            "author": "李专家", "role": "党史专家",
+        })
+        self.call("adopt_opinion", {
+            "opinion_id": first["id"], "actor": "王编辑", "role": "编辑"})
+        self.call("new_page_version", {
+            "page_id": page["id"],
+            "script_refs": {segment["id"]: 1},
+            "design_refs": {design["id"]: 1},
+            "source_refs": {source["id"]: 1},
+            "actor": "学员甲", "base_version": 1,
+        })
+        _, second = self.call("sign_opinion", {
+            "target_kind": "page", "target_id": page["id"], "scope": "史实",
+            "stance": "日期为9月24日", "content": "v2",
+            "author": "陈专家", "role": "军史专家",
+        })
+        status, _ = self.call("adopt_opinion", {
+            "opinion_id": second["id"], "actor": "王编辑", "role": "编辑"})
+        self.assertEqual(status, 200)
+        # 两条意见分属不同版本, 不产生会审议题: 页面仍可直接推进。
+        for target in ("待评审", "精稿中", "可出版"):
+            status, _ = self.call("transition_page", {
+                "page_id": page["id"], "target": target,
+                "actor": "王编辑", "role": "编辑",
+            })
+            self.assertEqual(status, 200, target)
+
+    def test_export_exclusion_carries_version_and_uses_export_date(self):
+        source, segment, design, page = self._seed_page()
+        for target in ("待评审", "精稿中", "可出版"):
+            self.call("transition_page", {
+                "page_id": page["id"], "target": target,
+                "actor": "王编辑", "role": "编辑",
+            })
+
+        # 另建一个授权 2030 年到期的已发布页: 许可按导出日期判断。
+        _, dated_source = self.call("register_source", {
+            "title": "限期史料", "citation": "限期出处",
+            "license": {"publication_scopes": ["国内", "海外"],
+                        "expires_at": "2030-01-01"},
+            "actor": "王编辑", "role": "编辑",
+        })
+        _, dated_page = self.call("create_page", {
+            "title": "限期页",
+            "script_refs": {segment["id"]: 1},
+            "design_refs": {design["id"]: 1},
+            "source_refs": {dated_source["id"]: 1},
+            "actor": "学员甲",
+        })
+        for target in ("待评审", "精稿中", "可出版"):
+            self.call("transition_page", {
+                "page_id": dated_page["id"], "target": target,
+                "actor": "王编辑", "role": "编辑",
+            })
+        status, result = self.call("export_batch", {
+            "scope": "海外", "on": "2029-06-01", "page_ids": [dated_page["id"]],
+            "actor": "王编辑", "role": "编辑",
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(result["exported_on"], "2029-06-01")
+        self.assertIn(dated_page["id"], {p["page_id"] for p in result["pages"]})
+
+        _, result = self.call("export_batch", {
+            "scope": "海外", "on": "2031-06-01", "page_ids": [dated_page["id"]],
+            "actor": "王编辑", "role": "编辑",
+        })
+        entry = result["excluded"][dated_page["id"]]
+        self.assertEqual(entry["page_version"], 1)
+        self.assertTrue(
+            any("过期" in r and "页面v1" in r for r in entry["reasons"]))
+
+        # 史料许可收紧为仅限国内后, 原海外页面被排除, 原因标注对应版本。
+        self.call("revise_source", {
+            "source_id": source["id"], "citation": "《战史》p12(修订)",
+            "license": {"publication_scopes": ["国内"]},
+            "actor": "王编辑", "role": "编辑", "base_revision": 1,
+        })
+        _, result = self.call("export_batch", {
+            "scope": "海外", "page_ids": [page["id"]],
+            "actor": "王编辑", "role": "编辑",
+        })
+        entry = result["excluded"][page["id"]]
+        self.assertEqual(entry["page_version"], 1)
+        self.assertTrue(any("出版范围" in r and "页面v1" in r for r in entry["reasons"]))
 
 
 if __name__ == "__main__":
