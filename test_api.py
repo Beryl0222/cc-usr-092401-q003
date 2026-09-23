@@ -12,18 +12,17 @@ from service import make_handler
 
 
 class ApiTest(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(ReviewSystem()))
-        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
-        cls.thread.start()
-        cls.base_url = f"http://127.0.0.1:{cls.server.server_port}"
+    def setUp(self):
+        self.server = ThreadingHTTPServer(
+            ("127.0.0.1", 0), make_handler(ReviewSystem()))
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.base_url = f"http://127.0.0.1:{self.server.server_port}"
 
-    @classmethod
-    def tearDownClass(cls):
-        cls.server.shutdown()
-        cls.server.server_close()
-        cls.thread.join(timeout=2)
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
 
     def call(self, action, payload=None):
         request = Request(
@@ -102,7 +101,7 @@ class ApiTest(unittest.TestCase):
         self.assertEqual([p["page_id"] for p in result["pages"]], [page["id"]])
         self.assertEqual(result["pages"][0]["sources"][0]["source_id"], source["id"])
 
-        # 史料授权过期后, 同一页面立即不可交付且被导出排除。
+        # 史料授权在r2过期后: 页面仍引用r1时只是依赖陈旧, 不会被新许可溯及。
         status, _ = self.call("revise_source", {
             "source_id": source["id"], "citation": "《战史》p12(修订)",
             "license": {"publication_scopes": ["国内", "海外"],
@@ -112,12 +111,33 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(status, 200)
         status, blockers = self.call("page_blockers", {"page_id": page["id"]})
         self.assertEqual(status, 200)
-        self.assertTrue(any("过期" in item for item in blockers))
+        self.assertTrue(any("依赖陈旧" in item for item in blockers))
+        self.assertFalse(any("过期" in item for item in blockers))
         _, result = self.call("export_batch", {
             "scope": "海外", "actor": "王编辑", "role": "编辑",
         })
         self.assertEqual(result["pages"], [])
         self.assertIn(page["id"], result["excluded"])
+
+        # 页面换版引用r2后, 按r2许可快照判断: 授权过期, 排除原因标注r2。
+        status, v2 = self.call("new_page_version", {
+            "page_id": page["id"],
+            "script_refs": {segment["id"]: 1},
+            "design_refs": {},
+            "source_refs": {source["id"]: 2},
+            "actor": "学员甲", "base_version": 1,
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(v2["version"], 2)
+        status, blockers = self.call("page_blockers", {"page_id": page["id"]})
+        self.assertEqual(status, 200)
+        self.assertTrue(any("过期" in item and "r2" in item for item in blockers))
+        _, result = self.call("export_batch", {
+            "scope": "海外", "actor": "王编辑", "role": "编辑",
+        })
+        reasons = result["excluded"][page["id"]]
+        self.assertTrue(any("过期" in item and "r2" in item for item in reasons))
+        self.assertEqual(result["pages"], [])
 
     def test_stale_version_conflict_maps_to_409(self):
         _, segment, _, _ = self._seed_page()
@@ -131,6 +151,118 @@ class ApiTest(unittest.TestCase):
         })
         self.assertEqual(status, 409)
         self.assertEqual(body["kind"], "StaleVersionError")
+
+    def test_old_version_opinion_adoption_rejected_then_reassigned(self):
+        _, _, _, page = self._seed_page()
+        _, old = self.call("sign_opinion", {
+            "target_kind": "page", "target_id": page["id"], "scope": "史实",
+            "stance": "日期为9月24日", "content": "针对v1",
+            "author": "李专家", "role": "党史专家",
+        })
+        # 页面改到第二版。
+        status, _ = self.call("new_page_version", {
+            "page_id": page["id"],
+            "script_refs": {}, "design_refs": {}, "source_refs": {},
+            "actor": "学员甲", "base_version": 1,
+        })
+        self.assertEqual(status, 200)
+        # 旧意见不能在新稿上直接采纳: 409 + 明确的过期语义。
+        status, body = self.call("adopt_opinion", {
+            "opinion_id": old["id"], "actor": "王编辑", "role": "编辑",
+        })
+        self.assertEqual(status, 409)
+        self.assertEqual(body["kind"], "OutdatedOpinionError")
+        # 原专家转签到新版本后可正常采纳。
+        status, renewed = self.call("reassign_opinion", {
+            "opinion_id": old["id"],
+            "actor": "李专家", "role": "党史专家",
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(renewed["target_version"], 2)
+        self.assertEqual(renewed["reissued_from"], old["id"])
+        status, adopted = self.call("adopt_opinion", {
+            "opinion_id": renewed["id"], "actor": "王编辑", "role": "编辑",
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(adopted["state"], "采纳")
+
+    def test_cross_version_opinions_do_not_create_conflict(self):
+        _, _, _, page = self._seed_page()
+        _, panel = self.call("add_panel", {
+            "page_id": page["id"], "page_version": 1, "index": 1,
+            "sketch_ref": "sketches/3-1.png", "actor": "学员甲",
+        })
+        _, first = self.call("sign_opinion", {
+            "target_kind": "page", "target_id": page["id"], "scope": "史实",
+            "stance": "日期为9月25日", "content": "依战报",
+            "author": "李专家", "role": "党史专家",
+        })
+        self.call("adopt_opinion", {
+            "opinion_id": first["id"], "actor": "王编辑", "role": "编辑"})
+        self.call("new_page_version", {
+            "page_id": page["id"],
+            "script_refs": {}, "design_refs": {}, "source_refs": {},
+            "actor": "学员甲", "base_version": 1,
+        })
+        _, second = self.call("sign_opinion", {
+            "target_kind": "page", "target_id": page["id"], "scope": "史实",
+            "stance": "日期为9月24日", "content": "依回忆录",
+            "author": "陈专家", "role": "军史专家",
+        })
+        status, _ = self.call("adopt_opinion", {
+            "opinion_id": second["id"], "actor": "王编辑", "role": "编辑"})
+        self.assertEqual(status, 200)
+        # 跨版本无冲突议题; 追溯中两条意见分属不同版本。
+        status, trace = self.call("panel_trace", {
+            "page_id": page["id"], "panel_id": panel["id"],
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(trace["issues"], [])
+        versions = {o["opinion_id"]: o["target_version"]
+                    for o in trace["opinions"]}
+        self.assertEqual(versions[first["id"]], 1)
+        self.assertEqual(versions[second["id"]], 2)
+
+    def test_export_on_parameter_controls_license_date(self):
+        source, _, _, page = self._seed_page()
+        # r1 授权2026年底到期。
+        self.call("revise_source", {
+            "source_id": source["id"], "citation": "《战史》p12",
+            "license": {"publication_scopes": ["国内", "海外"],
+                        "expires_at": "2026-12-31"},
+            "actor": "王编辑", "role": "编辑", "base_revision": 1,
+        })
+        self.call("new_page_version", {
+            "page_id": page["id"],
+            "script_refs": {}, "design_refs": {},
+            "source_refs": {source["id"]: 2},
+            "actor": "学员甲", "base_version": 1,
+        })
+        for target in ("待评审", "精稿中", "可出版"):
+            self.call("transition_page", {
+                "page_id": page["id"], "target": target,
+                "actor": "王编辑", "role": "编辑"})
+        # 指定导出日期在授权期内: 放行。
+        status, ok = self.call("export_batch", {
+            "scope": "海外", "on": "2026-10-01",
+            "actor": "王编辑", "role": "编辑",
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual([p["page_id"] for p in ok["pages"]], [page["id"]])
+        # 指定明年导出: 许可按该日期判过期, 排除原因带r2。
+        _, expired = self.call("export_batch", {
+            "scope": "海外", "on": "2027-01-01",
+            "actor": "王编辑", "role": "编辑",
+        })
+        reasons = expired["excluded"][page["id"]]
+        self.assertTrue(any("过期" in r and "r2" in r for r in reasons))
+        # 非法日期得到 400 而不是服务端错误。
+        status, body = self.call("export_batch", {
+            "scope": "海外", "on": "10/01/2026",
+            "actor": "王编辑", "role": "编辑",
+        })
+        self.assertEqual(status, 400)
+        self.assertEqual(body["kind"], "DomainError")
 
 
 if __name__ == "__main__":

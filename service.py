@@ -14,6 +14,7 @@ from domain import (
     DomainError,
     License,
     NotFoundError,
+    OutdatedOpinionError,
     PermissionDenied,
     ReviewSystem,
     StaleVersionError,
@@ -45,7 +46,10 @@ def _jsonable(value):
 def _parse_date(value):
     if value in (None, ""):
         return None
-    return date.fromisoformat(value)
+    try:
+        return date.fromisoformat(value)
+    except ValueError as error:
+        raise DomainError(f"日期格式应为YYYY-MM-DD: {value}") from error
 
 
 def _parse_license(payload):
@@ -75,6 +79,17 @@ def build_actions(system: ReviewSystem):
             return _jsonable(method(**data))
         return action
 
+    def with_date(*fields):
+        def decorate(method):
+            def action(payload):
+                data = dict(payload)
+                for field_name in fields:
+                    if field_name in data:
+                        data[field_name] = _parse_date(data[field_name])
+                return _jsonable(method(**data))
+            return action
+        return decorate
+
     return {
         "register_source": with_license(system.register_source),
         "revise_source": with_license(system.revise_source),
@@ -86,6 +101,7 @@ def build_actions(system: ReviewSystem):
         "new_page_version": call(system.new_page_version),
         "add_panel": call(system.add_panel),
         "sign_opinion": call(system.sign_opinion),
+        "reassign_opinion": call(system.reassign_opinion),
         "adopt_opinion": call(system.adopt_opinion),
         "reject_opinion": call(system.reject_opinion),
         "withdraw_opinion": call(system.withdraw_opinion),
@@ -93,9 +109,9 @@ def build_actions(system: ReviewSystem):
         "close_issue": call(system.close_issue),
         "submit_objection": call(system.submit_objection),
         "transition_page": call(system.transition_page),
-        "page_blockers": call(system.page_blockers),
+        "page_blockers": with_date("on")(system.page_blockers),
         "panel_trace": call(system.panel_trace),
-        "export_batch": call(system.export_batch),
+        "export_batch": with_date("on")(system.export_batch),
     }
 
 
@@ -103,6 +119,7 @@ ERROR_STATUS = {
     NotFoundError: 404,
     PermissionDenied: 403,
     StaleVersionError: 409,
+    OutdatedOpinionError: 409,
 }
 
 
